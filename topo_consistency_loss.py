@@ -1,188 +1,376 @@
-import numpy
-import gudhi as gd
-from pylab import *
-import torch
-import math
-from ripser import ripser
-import cripser as cr
-import os
-from gudhi.wasserstein import wasserstein_distance
+"""Noise-aware topological consistency loss used by TopoSemiSeg.
 
-def getCriticalPoints_cr(likelihood, threshold):
-        
-    lh = 1 - likelihood
-    pd = cr.computePH(lh, maxdim=1, location="birth")
-    pd_arr_lh = pd[pd[:, 0] == 0] # 0-dim topological features
-    pd_lh = pd_arr_lh[:, 1:3] # birth time and death time
-    # birth critical points
-    bcp_lh = pd_arr_lh[:, 3:5]
-    dcp_lh = pd_arr_lh[:, 6:8]
-    pairs_lh_pa = pd_arr_lh.shape[0] != 0 and pd_arr_lh is not None
+The persistent-homology computation and matching are discrete operations.  They
+are intentionally performed on detached NumPy arrays.  Once the critical pixels
+have been selected, the loss is assembled by indexing the original student
+tensor, so gradients still flow to the student network exactly as described in
+Eq. (5) and Eq. (7) of the paper.
+"""
 
-    # if the death time is inf, set it to 1.0
-    for i in pd_lh:
-        if i[1] > 1.0:
-            i[1] = 1.0
-    
-    pd_pers = abs(pd_lh[:, 1] - pd_lh[:, 0])
-    valid_idx = np.where(pd_pers > threshold)[0]
-    noisy_idx = np.where(pd_pers <= threshold)[0]
+from __future__ import annotations
 
-    pd_lh_filtered = pd_lh[valid_idx]
-    bcp_lh_filtered = bcp_lh[valid_idx]
-    dcp_lh_filtered = dcp_lh[valid_idx]
+from collections.abc import Iterable
+from dataclasses import dataclass
 
-    #return pd_lh_filtered, bcp_lh_filtered, dcp_lh_filtered, pairs_lh_pa
-    return pd_lh, bcp_lh, dcp_lh, pairs_lh_pa, valid_idx, noisy_idx
+import numpy as np
+from torch import Tensor, nn
+
+try:
+    import cripser
+except ImportError as exc:  # pragma: no cover - exercised only without extras
+    cripser = None
+    _CRIPSER_IMPORT_ERROR = exc
+else:
+    _CRIPSER_IMPORT_ERROR = None
+
+try:
+    from gudhi.wasserstein import wasserstein_distance
+except ImportError as exc:  # pragma: no cover - exercised only without extras
+    wasserstein_distance = None
+    _GUDHI_IMPORT_ERROR = exc
+else:
+    _GUDHI_IMPORT_ERROR = None
 
 
-def get_matchings(lh_stu, lh_tea):
-    
-    cost, matchings = wasserstein_distance(lh_stu, lh_tea, matching=True)
+@dataclass(frozen=True)
+class PersistenceDiagram:
+    """A zero-dimensional persistence diagram and its critical pixels."""
 
-    #print(f"Wasserstein distance value = {cost:.2f}")
-    dgm1_to_diagonal = matchings[matchings[:,1] == -1, 0]
-    dgm2_to_diagonal = matchings[matchings[:,0] == -1, 1]
-    off_diagonal_match = np.delete(matchings, np.where(matchings == -1)[0], axis=0)
+    points: np.ndarray
+    birth_pixels: np.ndarray
+    death_pixels: np.ndarray
+    signal_indices: np.ndarray
+    noise_indices: np.ndarray
 
-    return dgm1_to_diagonal, off_diagonal_match
+    @property
+    def has_points(self) -> bool:
+        return self.points.shape[0] > 0
 
 
-def compute_dgm_force(stu_lh_dgm, tea_lh_dgm):
+@dataclass(frozen=True)
+class TopologyLossParts:
+    """Separate terms of the loss, useful for logging and ablations."""
+
+    consistency: Tensor
+    removal: Tensor
+
+    @property
+    def total(self) -> Tensor:
+        return self.consistency + self.removal
+
+
+def _require_topology_dependencies() -> None:
+    if cripser is None:
+        raise ImportError(
+            "TopoSemiSeg requires `cripser` for persistent homology. "
+            "Install the dependencies with `pip install -r requirements.txt`."
+        ) from _CRIPSER_IMPORT_ERROR
+    if wasserstein_distance is None:
+        raise ImportError(
+            "TopoSemiSeg requires GUDHI and POT for persistence-diagram "
+            "matching. Install the dependencies with "
+            "`pip install -r requirements.txt`."
+        ) from _GUDHI_IMPORT_ERROR
+
+
+def extract_persistence_diagram(
+    foreground_probability: np.ndarray,
+    persistence_threshold: float = 0.7,
+) -> PersistenceDiagram:
+    """Extract the 0-D diagram used in the paper.
+
+    CubicalRipser implements a sublevel filtration.  The model predicts
+    foreground probability (large values are foreground), therefore the
+    filtration is ``1 - probability``.
     """
-    Compute the persistent diagram of the image
+
+    _require_topology_dependencies()
+    probability = np.asarray(foreground_probability, dtype=np.float64)
+    if probability.ndim != 2:
+        raise ValueError(
+            f"foreground_probability must be a 2-D array, got shape {probability.shape}"
+        )
+
+    raw = np.asarray(cripser.computePH(1.0 - probability, maxdim=1, location="birth"))
+    if raw.size == 0:
+        raw_0d = np.empty((0, 9), dtype=np.float64)
+    else:
+        raw_0d = raw[raw[:, 0] == 0]
+
+    points = np.asarray(raw_0d[:, 1:3], dtype=np.float64).copy()
+    if points.size:
+        # The essential component has infinite death.  As the filtration is
+        # bounded to [0, 1], the official implementation clips it to 1.
+        points[:, 1] = np.minimum(points[:, 1], 1.0)
+    birth_pixels = np.asarray(raw_0d[:, 3:5], dtype=np.int64)
+    death_pixels = np.asarray(raw_0d[:, 6:8], dtype=np.int64)
+    persistence = np.abs(points[:, 1] - points[:, 0])
+    signal = np.flatnonzero(persistence > persistence_threshold)
+    noise = np.flatnonzero(persistence <= persistence_threshold)
+    return PersistenceDiagram(
+        points=points,
+        birth_pixels=birth_pixels,
+        death_pixels=death_pixels,
+        signal_indices=signal,
+        noise_indices=noise,
+    )
+
+
+def match_signal_diagrams(
+    student_points: np.ndarray,
+    teacher_points: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return student-to-diagonal indices and student/teacher matched pairs."""
+
+    _require_topology_dependencies()
+    student_points = np.asarray(student_points, dtype=np.float64).reshape(-1, 2)
+    teacher_points = np.asarray(teacher_points, dtype=np.float64).reshape(-1, 2)
+
+    if student_points.shape[0] == 0:
+        return np.empty(0, dtype=np.int64), np.empty((0, 2), dtype=np.int64)
+    if teacher_points.shape[0] == 0:
+        return (
+            np.arange(student_points.shape[0], dtype=np.int64),
+            np.empty((0, 2), dtype=np.int64),
+        )
+
+    _, matching = wasserstein_distance(
+        student_points, teacher_points, matching=True, order=2
+    )
+    matching = np.asarray(matching, dtype=np.int64).reshape(-1, 2)
+    to_diagonal = matching[(matching[:, 0] >= 0) & (matching[:, 1] < 0), 0]
+    paired = matching[(matching[:, 0] >= 0) & (matching[:, 1] >= 0)]
+    return to_diagonal, paired
+
+
+def _valid_pixel(pixel: Iterable[int], height: int, width: int) -> bool:
+    row, col = (int(value) for value in pixel)
+    return 0 <= row < height and 0 <= col < width
+
+
+def _at(image: Tensor, pixel: Iterable[int]) -> Tensor:
+    row, col = (int(value) for value in pixel)
+    return image[row, col]
+
+
+def _endpoint_loss(
+    student_patch: Tensor,
+    teacher_patch: Tensor,
+    student_pixel: np.ndarray,
+    teacher_pixel: np.ndarray,
+) -> Tensor:
+    height, width = student_patch.shape
+    if not _valid_pixel(student_pixel, height, width):
+        return student_patch.sum() * 0.0
+    if not _valid_pixel(teacher_pixel, height, width):
+        return student_patch.sum() * 0.0
+    return (_at(student_patch, student_pixel) - _at(teacher_patch, teacher_pixel)) ** 2
+
+
+def _patch_topology_loss(
+    student_patch: Tensor,
+    teacher_patch: Tensor,
+    persistence_threshold: float,
+) -> TopologyLossParts:
+    zero = student_patch.sum() * 0.0
+    student_np = student_patch.detach().float().cpu().numpy()
+    teacher_np = teacher_patch.detach().float().cpu().numpy()
+
+    # Constant patches carry no useful finite topology and can otherwise add a
+    # boundary-dependent essential component.
+    if np.ptp(student_np) <= 1e-7:
+        return TopologyLossParts(zero, zero)
+
+    student = extract_persistence_diagram(student_np, persistence_threshold)
+    teacher = extract_persistence_diagram(teacher_np, persistence_threshold)
+    if not student.has_points:
+        return TopologyLossParts(zero, zero)
+
+    student_signal = student.points[student.signal_indices]
+    teacher_signal = teacher.points[teacher.signal_indices]
+    to_diagonal, paired = match_signal_diagrams(student_signal, teacher_signal)
+
+    consistency = zero
+    for student_local, teacher_local in paired:
+        student_index = int(student.signal_indices[student_local])
+        teacher_index = int(teacher.signal_indices[teacher_local])
+        consistency = consistency + _endpoint_loss(
+            student_patch,
+            teacher_patch,
+            student.birth_pixels[student_index],
+            teacher.birth_pixels[teacher_index],
+        )
+        consistency = consistency + _endpoint_loss(
+            student_patch,
+            teacher_patch,
+            student.death_pixels[student_index],
+            teacher.death_pixels[teacher_index],
+        )
+
+    # An unmatched student signal is matched to its orthogonal projection on
+    # the diagonal.  In probability coordinates this has the same midpoint.
+    height, width = student_patch.shape
+    for student_local in to_diagonal:
+        student_index = int(student.signal_indices[student_local])
+        birth_pixel = student.birth_pixels[student_index]
+        death_pixel = student.death_pixels[student_index]
+        if _valid_pixel(birth_pixel, height, width) and _valid_pixel(
+            death_pixel, height, width
+        ):
+            birth = _at(student_patch, birth_pixel)
+            death = _at(student_patch, death_pixel)
+            midpoint = (birth + death).detach() / 2.0
+            consistency = consistency + (birth - midpoint) ** 2
+            consistency = consistency + (death - midpoint) ** 2
+
+    # Eq. (7): second-order total persistence of all student noise dots.
+    removal = zero
+    for student_index in student.noise_indices:
+        birth_pixel = student.birth_pixels[int(student_index)]
+        death_pixel = student.death_pixels[int(student_index)]
+        if _valid_pixel(birth_pixel, height, width) and _valid_pixel(
+            death_pixel, height, width
+        ):
+            removal = (
+                removal
+                + (_at(student_patch, birth_pixel) - _at(student_patch, death_pixel))
+                ** 2
+            )
+
+    return TopologyLossParts(consistency=consistency, removal=removal)
+
+
+def topology_consistency_loss(
+    student_probability: Tensor,
+    teacher_probability: Tensor,
+    patch_size: int = 100,
+    persistence_threshold: float = 0.7,
+    reduction: str = "mean",
+    return_parts: bool = False,
+) -> Tensor | TopologyLossParts:
+    """Compute the paper's noise-aware topological consistency loss.
 
     Args:
-        stu_lh_dgm: likelihood persistent diagram of student model.
-        tea_lh_dgm: likelihood persistent diagram of teacher model.
-
-    Returns:
-        idx_holes_to_remove: The index of student persistent points that require to remove for the following training process
-        off_diagonal_match: The index pairs of persistent points that requires to fix in the following training process
-    
+        student_probability: Foreground probabilities with shape ``[H, W]``,
+            ``[B, H, W]``, or ``[B, 1, H, W]``.
+        teacher_probability: Same shape as ``student_probability``.  It is
+            detached internally; gradients only update the student.
+        patch_size: Non-overlapping PH window size.  ``0`` uses the full image.
+        persistence_threshold: Signal/noise split ``phi`` from the paper.
+        reduction: ``"mean"`` (paper's batch averaging) or ``"sum"``.
+        return_parts: Return consistency/removal terms separately for logging.
     """
-    if stu_lh_dgm.shape[0] == 0:
-        idx_holes_to_remove, off_diagonal_match = np.zeros((0,2)), np.zeros((0,2))
-        return idx_holes_to_remove, off_diagonal_match
-    
-    if (tea_lh_dgm.shape[0] == 0):
-        tea_pers = None
-        tea_n_holes = 0
-    else:
-        tea_pers = abs(tea_lh_dgm[:, 1] - tea_lh_dgm[:, 0])
-        tea_n_holes = tea_pers.size
 
-    if (tea_pers is None or tea_n_holes == 0):
-        idx_holes_to_remove = list(set(range(stu_lh_dgm.shape[0])))
-        off_diagonal_match = list()
-    else:
-        idx_holes_to_remove, off_diagonal_match = get_matchings(stu_lh_dgm, tea_lh_dgm)
-    
-    return idx_holes_to_remove, off_diagonal_match
+    if student_probability.shape != teacher_probability.shape:
+        raise ValueError(
+            "student and teacher probability maps must have the same shape, "
+            f"got {student_probability.shape} and {teacher_probability.shape}"
+        )
+    if not student_probability.is_floating_point():
+        raise TypeError("student_probability must be a floating-point tensor")
+    if patch_size < 0:
+        raise ValueError("patch_size must be non-negative")
+    if not 0.0 <= persistence_threshold <= 1.0:
+        raise ValueError("persistence_threshold must be in [0, 1]")
+    if reduction not in {"mean", "sum"}:
+        raise ValueError("reduction must be 'mean' or 'sum'")
+
+    student = student_probability
+    teacher = teacher_probability.detach().to(
+        device=student.device, dtype=student.dtype
+    )
+    if student.ndim == 2:
+        student = student.unsqueeze(0)
+        teacher = teacher.unsqueeze(0)
+    elif student.ndim == 4 and student.shape[1] == 1:
+        student = student[:, 0]
+        teacher = teacher[:, 0]
+    elif student.ndim != 3:
+        raise ValueError(
+            f"expected [H,W], [B,H,W], or [B,1,H,W], got {student_probability.shape}"
+        )
+
+    consistency = student.sum() * 0.0
+    removal = student.sum() * 0.0
+    for student_image, teacher_image in zip(student, teacher):
+        height, width = student_image.shape
+        window = patch_size or max(height, width)
+        for top in range(0, height, window):
+            for left in range(0, width, window):
+                parts = _patch_topology_loss(
+                    student_image[top : top + window, left : left + window],
+                    teacher_image[top : top + window, left : left + window],
+                    persistence_threshold,
+                )
+                consistency = consistency + parts.consistency
+                removal = removal + parts.removal
+
+    if reduction == "mean":
+        consistency = consistency / student.shape[0]
+        removal = removal / student.shape[0]
+    parts = TopologyLossParts(consistency=consistency, removal=removal)
+    return parts if return_parts else parts.total
 
 
-def getTopoLoss(stu_tensor, tea_tensor, topo_size=100, pd_threshold=0.7, loss_mode="mse"):
+class TopologyConsistencyLoss(nn.Module):
+    """``nn.Module`` wrapper around :func:`topology_consistency_loss`."""
 
-    if stu_tensor.ndim != 2:
-        print("incorrct dimension")
-    
-    likelihood = stu_tensor.clone()
-    gt = tea_tensor.clone()
+    def __init__(
+        self,
+        patch_size: int = 100,
+        persistence_threshold: float = 0.7,
+        reduction: str = "mean",
+    ) -> None:
+        super().__init__()
+        self.patch_size = patch_size
+        self.persistence_threshold = persistence_threshold
+        self.reduction = reduction
 
-    likelihood = torch.squeeze(likelihood).cpu().detach().numpy()
-    gt = torch.squeeze(gt).cpu().detach().numpy()
+    def forward(
+        self,
+        student_probability: Tensor,
+        teacher_probability: Tensor,
+        return_parts: bool = False,
+    ) -> Tensor | TopologyLossParts:
+        return topology_consistency_loss(
+            student_probability,
+            teacher_probability,
+            patch_size=self.patch_size,
+            persistence_threshold=self.persistence_threshold,
+            reduction=self.reduction,
+            return_parts=return_parts,
+        )
 
-    topo_cp_weight_map = np.zeros(likelihood.shape)
-    topo_cp_ref_map = np.zeros(likelihood.shape)
 
-    for y in range(0, likelihood.shape[0], topo_size):
-        for x in range(0, likelihood.shape[1], topo_size):
-            #print("Loop itr (x,y) = {},{}".format(x,y))
-            lh_patch = likelihood[y:min(y + topo_size, likelihood.shape[0]),
-                         x:min(x + topo_size, likelihood.shape[1])]
-            gt_patch = gt[y:min(y + topo_size, gt.shape[0]),
-                         x:min(x + topo_size, gt.shape[1])]
+# Backward-compatible names used in the repository's original README.
+def getTopoLoss(
+    stu_tensor: Tensor,
+    tea_tensor: Tensor,
+    topo_size: int = 100,
+    pd_threshold: float = 0.7,
+    loss_mode: str = "mse",
+) -> Tensor:
+    if loss_mode != "mse":
+        raise ValueError("The paper defines only the squared (MSE) topology loss")
+    return topology_consistency_loss(
+        stu_tensor,
+        tea_tensor,
+        patch_size=topo_size,
+        persistence_threshold=pd_threshold,
+        reduction="sum",
+    )
 
-            if(np.min(lh_patch) == 1 or np.max(lh_patch) == 0): continue
-            if(np.min(gt_patch) == 1 or np.max(gt_patch) == 0): continue
-            
-            # Get the critical points of predictions and ground truth
-            pd_lh, bcp_lh, dcp_lh, pairs_lh_pa, valid_idx_lh, noisy_idx_lh = getCriticalPoints_cr(lh_patch, threshold=pd_threshold)
-            pd_gt, bcp_gt, dcp_gt, pairs_lh_gt, valid_idx_gt, noisy_idx_gt = getCriticalPoints_cr(gt_patch, threshold=pd_threshold)
 
-            # select pd with high threshold to match
-            pd_lh_for_matching = pd_lh[valid_idx_lh]
-            pd_gt_for_matching = pd_gt[valid_idx_gt]
-
-            # If the pairs not exist, continue for the next loop
-            if not(pairs_lh_pa): continue
-            if not(pairs_lh_gt): continue
-
-            idx_holes_to_remove_for_matching, off_diagonal_for_matching = compute_dgm_force(pd_lh_for_matching, pd_gt_for_matching)
-
-            idx_holes_to_remove = []
-            off_diagonal_match = []
-
-            if (len(idx_holes_to_remove_for_matching) > 0):
-                for i in idx_holes_to_remove_for_matching:
-                    index_pd_lh_removed = np.where(np.all(pd_lh == pd_lh_for_matching[i], axis=1))[0][0]
-                    idx_holes_to_remove.append(index_pd_lh_removed)
-            
-            for k in noisy_idx_lh:
-                idx_holes_to_remove.append(k)
-            
-            if len(off_diagonal_for_matching) > 0:
-                for idx, (i, j) in enumerate(off_diagonal_for_matching):
-                    index_pd_lh = np.where(np.all(pd_lh == pd_lh_for_matching[i], axis=1))[0][0]
-                    index_pd_gt = np.where(np.all(pd_gt == pd_gt_for_matching[j], axis=1))[0][0]
-                    off_diagonal_match.append((index_pd_lh, index_pd_gt))
-
-            if (len(off_diagonal_match) > 0 or len(idx_holes_to_remove) > 0):
-                for (idx, (hole_indx, j)) in enumerate(off_diagonal_match):
-                    if (int(bcp_lh[hole_indx][0]) >= 0 and int(bcp_lh[hole_indx][0]) < likelihood.shape[0] and int(
-                            bcp_lh[hole_indx][1]) >= 0 and int(bcp_lh[hole_indx][1]) < likelihood.shape[1]):
-                        topo_cp_weight_map[y + int(bcp_lh[hole_indx][0]), x + int(
-                            bcp_lh[hole_indx][1])] = 1 # push birth to the corresponding teacher birth i.e. min birth prob or likelihood
-                        topo_cp_ref_map[y + int(bcp_lh[hole_indx][0]), x + int(bcp_lh[hole_indx][1])] = pd_gt[j][0]
-                    
-                    if (int(dcp_lh[hole_indx][0]) >= 0 and int(dcp_lh[hole_indx][0]) < likelihood.shape[
-                        0] and int(dcp_lh[hole_indx][1]) >= 0 and int(dcp_lh[hole_indx][1]) <
-                            likelihood.shape[1]):
-                        topo_cp_weight_map[y + int(dcp_lh[hole_indx][0]), x + int(
-                            dcp_lh[hole_indx][1])] = 1  # push death to the corresponding teacher death i.e. max death prob or likelihood
-                        topo_cp_ref_map[y + int(dcp_lh[hole_indx][0]), x + int(dcp_lh[hole_indx][1])] = pd_gt[j][1]
-                
-                for hole_indx in idx_holes_to_remove:
-                    if (int(bcp_lh[hole_indx][0]) >= 0 and int(bcp_lh[hole_indx][0]) < likelihood.shape[
-                        0] and int(bcp_lh[hole_indx][1]) >= 0 and int(bcp_lh[hole_indx][1]) <
-                            likelihood.shape[1]):
-                        topo_cp_weight_map[y + int(bcp_lh[hole_indx][0]), x + int(
-                            bcp_lh[hole_indx][1])] = 1  # push to diagonal
-                        if (int(dcp_lh[hole_indx][0]) >= 0 and int(dcp_lh[hole_indx][0]) < likelihood.shape[
-                            0] and int(dcp_lh[hole_indx][1]) >= 0 and int(dcp_lh[hole_indx][1]) <
-                                likelihood.shape[1]):
-                            topo_cp_ref_map[y + int(bcp_lh[hole_indx][0]), x + int(bcp_lh[hole_indx][1])] = \
-                                lh_patch[int(dcp_lh[hole_indx][0]), int(dcp_lh[hole_indx][1])]
-                        else:
-                            topo_cp_ref_map[y + int(bcp_lh[hole_indx][0]), x + int(bcp_lh[hole_indx][1])] = 1
-                    if (int(dcp_lh[hole_indx][0]) >= 0 and int(dcp_lh[hole_indx][0]) < likelihood.shape[
-                        0] and int(dcp_lh[hole_indx][1]) >= 0 and int(dcp_lh[hole_indx][1]) <
-                            likelihood.shape[1]):
-                        topo_cp_weight_map[y + int(dcp_lh[hole_indx][0]), x + int(
-                            dcp_lh[hole_indx][1])] = 1  # push to diagonal
-                        if (int(bcp_lh[hole_indx][0]) >= 0 and int(bcp_lh[hole_indx][0]) < likelihood.shape[
-                            0] and int(bcp_lh[hole_indx][1]) >= 0 and int(bcp_lh[hole_indx][1]) <
-                                likelihood.shape[1]):
-                            topo_cp_ref_map[y + int(dcp_lh[hole_indx][0]), x + int(dcp_lh[hole_indx][1])] = \
-                                lh_patch[int(bcp_lh[hole_indx][0]), int(bcp_lh[hole_indx][1])]
-                        else:
-                            topo_cp_ref_map[y + int(dcp_lh[hole_indx][0]), x + int(dcp_lh[hole_indx][1])] = 0
-
-    topo_cp_weight_map = torch.tensor(topo_cp_weight_map, dtype=torch.float).cuda()
-    topo_cp_ref_map = torch.tensor(topo_cp_ref_map, dtype=torch.float).cuda()
-
-    # Measuring the MSE loss between predicted critical points and reference critical points
-    loss_topo = (((stu_tensor * topo_cp_weight_map) - topo_cp_ref_map) ** 2).sum()
-
-    return loss_topo
-
+def calculate_topo_loss(
+    likelihood: Tensor,
+    target: Tensor,
+    topo_size: int = 100,
+    pd_threshold: float = 0.7,
+) -> Tensor:
+    return topology_consistency_loss(
+        likelihood,
+        target,
+        patch_size=topo_size,
+        persistence_threshold=pd_threshold,
+        reduction="mean",
+    )

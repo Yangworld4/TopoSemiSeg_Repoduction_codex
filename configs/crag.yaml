@@ -1,0 +1,45 @@
+seed: 1337
+device: cuda
+output_dir: runs/crag_20pct
+
+model:
+  in_channels: 3
+  num_classes: 2
+  foreground_class: 1
+  base_channels: 32
+  deep_supervision: false
+
+data:
+  labeled_manifest: data/CRAG/manifests/paper_seed_2026/labeled_20.csv
+  unlabeled_manifest: data/CRAG/manifests/paper_seed_2026/unlabeled_20.csv
+  validation_manifest: data/CRAG/manifests/paper_seed_2026/validation.csv
+  crop_size: 256
+  # The paper reports a total batch size of 16, split equally here.
+  labeled_batch_size: 8
+  unlabeled_batch_size: 8
+  num_workers: 4
+  mean: [0.5, 0.5, 0.5]
+  std: [0.5, 0.5, 0.5]
+
+augmentation:
+  brightness: 0.3
+  contrast: 0.1
+  morphology_probability: 0.5
+
+training:
+  learning_rate: 0.0005
+  weight_decay: 0.0
+  pretrain_iterations: 12000
+  finetune_epochs: 500
+  supervised_ce_weight: 0.5
+  supervised_dice_weight: 0.5
+  pixel_consistency_max_weight: 0.1
+  topology_weight: 0.002
+  persistence_threshold: 0.7
+  topology_patch_size: 100
+  topology_interval: 1
+  ema_decay: 0.999
+  amp: true
+  log_interval: 20
+  checkpoint_interval: 1000
+  validation_interval: 1
