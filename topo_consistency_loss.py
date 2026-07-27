@@ -1,10 +1,12 @@
 """Noise-aware topological consistency loss used by TopoSemiSeg.
 
-The persistent-homology computation and matching are discrete operations.  They
-are intentionally performed on detached NumPy arrays.  Once the critical pixels
-have been selected, the loss is assembled by indexing the original student
-tensor, so gradients still flow to the student network exactly as described in
-Eq. (5) and Eq. (7) of the paper.
+The numerical path follows the officially released ``getTopoLoss``:
+https://github.com/Melon-Xu/TopoSemiSeg/blob/main/topo_consistency_loss.py
+
+Only device-independent tensor placement, input validation, batching, and
+logging wrappers are added. Persistent-homology computation and matching are
+performed on detached NumPy arrays; the final critical-point map loss remains
+connected to the original student tensor.
 """
 
 from __future__ import annotations
@@ -49,13 +51,16 @@ class PersistenceDiagram:
 
 @dataclass(frozen=True)
 class TopologyLossParts:
-    """Separate terms of the loss, useful for logging and ablations."""
+    """Signal/noise terms plus the exact combined loss from the official code."""
 
     consistency: Tensor
     removal: Tensor
+    combined: Tensor | None = None
 
     @property
     def total(self) -> Tensor:
+        if self.combined is not None:
+            return self.combined
         return self.consistency + self.removal
 
 
@@ -134,9 +139,9 @@ def match_signal_diagrams(
             np.empty((0, 2), dtype=np.int64),
         )
 
-    _, matching = wasserstein_distance(
-        student_points, teacher_points, matching=True, order=2
-    )
+    # Keep the official call signature. In particular, do not override GUDHI's
+    # Wasserstein order because that can change the selected correspondence.
+    _, matching = wasserstein_distance(student_points, teacher_points, matching=True)
     matching = np.asarray(matching, dtype=np.int64).reshape(-1, 2)
     to_diagonal = matching[(matching[:, 0] >= 0) & (matching[:, 1] < 0), 0]
     paired = matching[(matching[:, 0] >= 0) & (matching[:, 1] >= 0)]
@@ -148,96 +153,148 @@ def _valid_pixel(pixel: Iterable[int], height: int, width: int) -> bool:
     return 0 <= row < height and 0 <= col < width
 
 
-def _at(image: Tensor, pixel: Iterable[int]) -> Tensor:
-    row, col = (int(value) for value in pixel)
-    return image[row, col]
-
-
-def _endpoint_loss(
-    student_patch: Tensor,
-    teacher_patch: Tensor,
-    student_pixel: np.ndarray,
-    teacher_pixel: np.ndarray,
-) -> Tensor:
-    height, width = student_patch.shape
-    if not _valid_pixel(student_pixel, height, width):
-        return student_patch.sum() * 0.0
-    if not _valid_pixel(teacher_pixel, height, width):
-        return student_patch.sum() * 0.0
-    return (_at(student_patch, student_pixel) - _at(teacher_patch, teacher_pixel)) ** 2
-
-
 def _patch_topology_loss(
     student_patch: Tensor,
     teacher_patch: Tensor,
     persistence_threshold: float,
 ) -> TopologyLossParts:
+    """Official ``getTopoLoss`` computation for one topology window.
+
+    The released implementation constructs a weight map and a detached
+    reference map, then applies a summed squared error at the selected student
+    critical pixels. The somewhat unusual use of persistence-diagram
+    coordinates as teacher references is intentionally retained for numerical
+    reproduction.
+    """
+
     zero = student_patch.sum() * 0.0
     student_np = student_patch.detach().float().cpu().numpy()
     teacher_np = teacher_patch.detach().float().cpu().numpy()
 
-    # Constant patches carry no useful finite topology and can otherwise add a
-    # boundary-dependent essential component.
-    if np.ptp(student_np) <= 1e-7:
-        return TopologyLossParts(zero, zero)
+    # These are the exact early-exit conditions in the released implementation.
+    if np.min(student_np) == 1 or np.max(student_np) == 0:
+        return TopologyLossParts(zero, zero, zero)
+    if np.min(teacher_np) == 1 or np.max(teacher_np) == 0:
+        return TopologyLossParts(zero, zero, zero)
 
     student = extract_persistence_diagram(student_np, persistence_threshold)
     teacher = extract_persistence_diagram(teacher_np, persistence_threshold)
-    if not student.has_points:
-        return TopologyLossParts(zero, zero)
+    # The official code skips the whole patch unless both unfiltered diagrams
+    # contain at least one point.
+    if not student.has_points or not teacher.has_points:
+        return TopologyLossParts(zero, zero, zero)
 
     student_signal = student.points[student.signal_indices]
     teacher_signal = teacher.points[teacher.signal_indices]
     to_diagonal, paired = match_signal_diagrams(student_signal, teacher_signal)
 
-    consistency = zero
+    height, width = student_patch.shape
+    combined_weight = np.zeros((height, width), dtype=np.float32)
+    combined_reference = np.zeros((height, width), dtype=np.float32)
+    signal_weight = np.zeros((height, width), dtype=np.float32)
+    signal_reference = np.zeros((height, width), dtype=np.float32)
+    noise_weight = np.zeros((height, width), dtype=np.float32)
+    noise_reference = np.zeros((height, width), dtype=np.float32)
+
+    def assign(
+        pixel: np.ndarray,
+        reference: float,
+        category_weight: np.ndarray,
+        category_reference: np.ndarray,
+    ) -> None:
+        if not _valid_pixel(pixel, height, width):
+            return
+        row, col = (int(value) for value in pixel)
+        # Assignments, rather than additions, preserve the overwrite behavior
+        # of the official critical-point maps.
+        category_weight[row, col] = 1.0
+        category_reference[row, col] = reference
+        combined_weight[row, col] = 1.0
+        combined_reference[row, col] = reference
+
+    # Official signal matching: compare student foreground probability at its
+    # critical pixels against the matched teacher PD coordinates.
+    def official_full_index(points: np.ndarray, filtered_point: np.ndarray) -> int:
+        # The released code maps a filtered point back with the first exact
+        # row match, so retain that behavior when duplicate PD rows exist.
+        return int(np.where(np.all(points == filtered_point, axis=1))[0][0])
+
     for student_local, teacher_local in paired:
-        student_index = int(student.signal_indices[student_local])
-        teacher_index = int(teacher.signal_indices[teacher_local])
-        consistency = consistency + _endpoint_loss(
-            student_patch,
-            teacher_patch,
-            student.birth_pixels[student_index],
-            teacher.birth_pixels[teacher_index],
+        student_index = official_full_index(
+            student.points,
+            student_signal[int(student_local)],
         )
-        consistency = consistency + _endpoint_loss(
-            student_patch,
-            teacher_patch,
+        teacher_index = official_full_index(
+            teacher.points,
+            teacher_signal[int(teacher_local)],
+        )
+        assign(
+            student.birth_pixels[student_index],
+            float(teacher.points[teacher_index, 0]),
+            signal_weight,
+            signal_reference,
+        )
+        assign(
             student.death_pixels[student_index],
-            teacher.death_pixels[teacher_index],
+            float(teacher.points[teacher_index, 1]),
+            signal_weight,
+            signal_reference,
         )
 
-    # An unmatched student signal is matched to its orthogonal projection on
-    # the diagonal.  In probability coordinates this has the same midpoint.
-    height, width = student_patch.shape
-    for student_local in to_diagonal:
-        student_index = int(student.signal_indices[student_local])
+    # The released implementation pushes unmatched signal points and noisy
+    # points to the diagonal by swapping their detached endpoint values.
+    def assign_diagonal(
+        student_index: int,
+        category_weight: np.ndarray,
+        category_reference: np.ndarray,
+    ) -> None:
         birth_pixel = student.birth_pixels[student_index]
         death_pixel = student.death_pixels[student_index]
-        if _valid_pixel(birth_pixel, height, width) and _valid_pixel(
-            death_pixel, height, width
-        ):
-            birth = _at(student_patch, birth_pixel)
-            death = _at(student_patch, death_pixel)
-            midpoint = (birth + death).detach() / 2.0
-            consistency = consistency + (birth - midpoint) ** 2
-            consistency = consistency + (death - midpoint) ** 2
+        birth_valid = _valid_pixel(birth_pixel, height, width)
+        death_valid = _valid_pixel(death_pixel, height, width)
+        birth_reference = (
+            float(student_np[tuple(death_pixel.astype(int))])
+            if death_valid
+            else 1.0
+        )
+        death_reference = (
+            float(student_np[tuple(birth_pixel.astype(int))])
+            if birth_valid
+            else 0.0
+        )
+        assign(
+            birth_pixel,
+            birth_reference,
+            category_weight,
+            category_reference,
+        )
+        assign(
+            death_pixel,
+            death_reference,
+            category_weight,
+            category_reference,
+        )
 
-    # Eq. (7): second-order total persistence of all student noise dots.
-    removal = zero
+    for student_local in to_diagonal:
+        student_index = official_full_index(
+            student.points,
+            student_signal[int(student_local)],
+        )
+        assign_diagonal(student_index, signal_weight, signal_reference)
+
     for student_index in student.noise_indices:
-        birth_pixel = student.birth_pixels[int(student_index)]
-        death_pixel = student.death_pixels[int(student_index)]
-        if _valid_pixel(birth_pixel, height, width) and _valid_pixel(
-            death_pixel, height, width
-        ):
-            removal = (
-                removal
-                + (_at(student_patch, birth_pixel) - _at(student_patch, death_pixel))
-                ** 2
-            )
+        assign_diagonal(int(student_index), noise_weight, noise_reference)
 
-    return TopologyLossParts(consistency=consistency, removal=removal)
+    def map_loss(weight: np.ndarray, reference: np.ndarray) -> Tensor:
+        weight_tensor = student_patch.new_tensor(weight)
+        reference_tensor = student_patch.new_tensor(reference)
+        return ((student_patch * weight_tensor - reference_tensor) ** 2).sum()
+
+    return TopologyLossParts(
+        consistency=map_loss(signal_weight, signal_reference),
+        removal=map_loss(noise_weight, noise_reference),
+        combined=map_loss(combined_weight, combined_reference),
+    )
 
 
 def topology_consistency_loss(
@@ -292,6 +349,7 @@ def topology_consistency_loss(
 
     consistency = student.sum() * 0.0
     removal = student.sum() * 0.0
+    combined = student.sum() * 0.0
     for student_image, teacher_image in zip(student, teacher):
         height, width = student_image.shape
         window = patch_size or max(height, width)
@@ -304,11 +362,17 @@ def topology_consistency_loss(
                 )
                 consistency = consistency + parts.consistency
                 removal = removal + parts.removal
+                combined = combined + parts.total
 
     if reduction == "mean":
         consistency = consistency / student.shape[0]
         removal = removal / student.shape[0]
-    parts = TopologyLossParts(consistency=consistency, removal=removal)
+        combined = combined / student.shape[0]
+    parts = TopologyLossParts(
+        consistency=consistency,
+        removal=removal,
+        combined=combined,
+    )
     return parts if return_parts else parts.total
 
 

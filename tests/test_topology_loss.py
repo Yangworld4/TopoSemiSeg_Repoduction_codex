@@ -64,8 +64,12 @@ def test_signal_and_noise_terms_keep_student_gradient(
         return_parts=True,
     )
     assert isinstance(parts, topology.TopologyLossParts)
-    assert torch.allclose(parts.consistency, torch.tensor(0.02))
-    assert torch.allclose(parts.removal, torch.tensor(0.01))
+    # The official implementation uses the matched teacher persistence
+    # coordinates (0.2, 0.8) as references for the student critical pixels and
+    # swaps both endpoints when removing a noisy point.
+    assert torch.allclose(parts.consistency, torch.tensor(0.98))
+    assert torch.allclose(parts.removal, torch.tensor(0.02))
+    assert torch.allclose(parts.total, torch.tensor(1.0))
     parts.total.backward()
     assert student.grad is not None
     assert teacher.grad is None

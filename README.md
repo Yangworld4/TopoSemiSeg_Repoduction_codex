@@ -109,6 +109,7 @@ Outputs are written under `output_dir`:
 - `resolved_config.yaml`: exact run configuration;
 - `metrics.jsonl`: machine-readable training/validation log;
 - `pretrained.pt`: stage-one checkpoint;
+- `best.pt`: fine-tuning checkpoint with the highest validation `dice_obj`;
 - `last.pt`: latest fine-tuning checkpoint.
 
 Resume an interrupted run by passing `--checkpoint path/to/last.pt`.
@@ -118,7 +119,7 @@ Resume an interrupted run by passing `--checkpoint path/to/last.pt`.
 ```bash
 python evaluate.py \
   --config configs/crag.yaml \
-  --checkpoint runs/crag_20pct/last.pt \
+  --checkpoint runs/crag_20pct/best.pt \
   --manifest data/CRAG/manifests/paper_seed_2026/test.csv
 ```
 
@@ -148,9 +149,15 @@ topology_loss = criterion(student_probability, teacher_probability)
 loss = supervised_loss + pixel_weight * pixel_loss + 0.002 * topology_loss
 ```
 
-`return_parts=True` returns `consistency` (Eq. 5) and `removal` (Eq. 7)
-separately. The old `getTopoLoss(...)` and `calculate_topo_loss(...)` entry
-points remain available.
+The implementation follows the numerical behavior of the officially released
+`getTopoLoss(...)`, including its persistence-diagram matching targets and
+critical-point reference maps. The code adds device-independent tensor
+placement and batched `TopologyConsistencyLoss`/`calculate_topo_loss(...)`
+wrappers while keeping the per-image loss numerically equivalent to the
+official implementation.
+
+`return_parts=True` additionally exposes signal and noise map losses for
+logging. `parts.total` always contains the exact combined official loss.
 
 ## 6. Reproduction notes
 

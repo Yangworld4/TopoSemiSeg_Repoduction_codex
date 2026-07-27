@@ -157,6 +157,7 @@ def save_checkpoint(
     stage: str,
     global_step: int,
     epoch: int,
+    best_score: float | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -170,6 +171,7 @@ def save_checkpoint(
             "stage": stage,
             "global_step": global_step,
             "epoch": epoch,
+            "best_score": best_score,
         },
         temporary,
     )
@@ -183,7 +185,7 @@ def load_checkpoint(
     optimizer: torch.optim.Optimizer,
     scaler: Any,
     device: torch.device,
-) -> tuple[int, int]:
+) -> tuple[int, int, float]:
     checkpoint = torch.load(path, map_location=device)
     student.load_state_dict(checkpoint["student"])
     teacher.load_state_dict(checkpoint["teacher"])
@@ -191,7 +193,15 @@ def load_checkpoint(
         optimizer.load_state_dict(checkpoint["optimizer"])
     if "scaler" in checkpoint:
         scaler.load_state_dict(checkpoint["scaler"])
-    return int(checkpoint.get("global_step", 0)), int(checkpoint.get("epoch", 0))
+    saved_best_score = checkpoint.get("best_score")
+    best_score = (
+        float(saved_best_score) if saved_best_score is not None else float("-inf")
+    )
+    return (
+        int(checkpoint.get("global_step", 0)),
+        int(checkpoint.get("epoch", 0)),
+        best_score,
+    )
 
 
 @torch.no_grad()
@@ -353,8 +363,9 @@ def main() -> None:
 
     global_step = 0
     start_epoch = 0
+    best_score = float("-inf")
     if args.checkpoint:
-        global_step, start_epoch = load_checkpoint(
+        global_step, start_epoch, best_score = load_checkpoint(
             args.checkpoint,
             student,
             teacher,
@@ -406,6 +417,7 @@ def main() -> None:
                     "pretrain",
                     global_step,
                     0,
+                    best_score,
                 )
         save_checkpoint(
             output_dir / "pretrained.pt",
@@ -417,6 +429,7 @@ def main() -> None:
             "pretrain",
             global_step,
             0,
+            best_score,
         )
 
     if args.stage in {"all", "finetune"}:
@@ -448,18 +461,36 @@ def main() -> None:
                 **{key: value / steps_per_epoch for key, value in aggregate.items()},
             }
             validation_interval = int(training.get("validation_interval", 1))
+            validation_metrics: dict[str, float] | None = None
             if validation_loader is not None and (epoch + 1) % validation_interval == 0:
+                validation_metrics = validate(
+                    student,
+                    validation_loader,
+                    device,
+                    int(model_config.get("foreground_class", 1)),
+                )
                 record.update(
                     {
                         f"val_{key}": value
-                        for key, value in validate(
-                            student,
-                            validation_loader,
-                            device,
-                            int(model_config.get("foreground_class", 1)),
-                        ).items()
+                        for key, value in validation_metrics.items()
                     }
                 )
+                score = validation_metrics["dice_obj"]
+                if score > best_score:
+                    best_score = score
+                    record["best_checkpoint"] = True
+                    save_checkpoint(
+                        output_dir / "best.pt",
+                        student,
+                        teacher,
+                        optimizer,
+                        scaler,
+                        config,
+                        "finetune",
+                        global_step,
+                        epoch + 1,
+                        best_score,
+                    )
             log_record(log_path, record)
             save_checkpoint(
                 output_dir / "last.pt",
@@ -471,6 +502,7 @@ def main() -> None:
                 "finetune",
                 global_step,
                 epoch + 1,
+                best_score,
             )
 
 
